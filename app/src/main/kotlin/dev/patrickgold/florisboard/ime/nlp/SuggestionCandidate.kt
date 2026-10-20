@@ -106,6 +106,7 @@ interface SuggestionCandidate {
  */
 data class WordSuggestionCandidate(
     override val text: CharSequence,
+    val originalText: CharSequence? = null,
     override val secondaryText: CharSequence? = null,
     override val confidence: Double = 0.0,
     override val isEligibleForAutoCommit: Boolean = false,

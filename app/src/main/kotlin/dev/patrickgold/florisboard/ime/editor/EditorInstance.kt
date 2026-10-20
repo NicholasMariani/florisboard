@@ -34,6 +34,7 @@ import dev.patrickgold.florisboard.ime.input.InputShiftState
 import dev.patrickgold.florisboard.ime.keyboard.IncognitoMode
 import dev.patrickgold.florisboard.ime.keyboard.KeyboardMode
 import dev.patrickgold.florisboard.ime.nlp.SuggestionCandidate
+import dev.patrickgold.florisboard.ime.nlp.WordSuggestionCandidate
 import dev.patrickgold.florisboard.ime.text.composing.Appender
 import dev.patrickgold.florisboard.ime.text.composing.Composer
 import dev.patrickgold.florisboard.ime.text.key.KeyVariation
@@ -48,6 +49,8 @@ import org.florisboard.lib.android.showShortToastSync
 class EditorInstance(context: Context) : AbstractEditorInstance(context) {
     companion object {
         private const val SPACE = " "
+        private var autoCorrectionForRevert: Pair<String, String>? = null
+        private var suppressedAutoCorrectionToken: String? = null
     }
 
     private val prefs by FlorisPreferenceStore
@@ -197,6 +200,7 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
     }
 
     override fun commitChar(char: String): Boolean {
+        suppressedAutoCorrectionToken = null
         val isInsertAutoSpaceBeforeChar = shouldInsertAutoSpaceBefore(char)
         val isInsertAutoSpaceAfterChar = shouldInsertAutoSpaceAfter(char)
         val isDeletePreviousSpace = isInsertAutoSpaceAfterChar && autoSpace.isActive
@@ -252,6 +256,16 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
     fun commitCompletion(candidate: SuggestionCandidate): Boolean {
         val text = candidate.text.toString()
         if (text.isEmpty() || activeInfo.isRawInputEditor) return false
+        (candidate as? WordSuggestionCandidate)?.originalText?.toString()?.let { candidateOriginal ->
+            val original = candidateOriginal.ifBlank {
+                activeContent.composingText.ifBlank {
+                    activeContent.currentWordText.ifBlank { currentTokenBeforeCursor() }
+                }
+            }
+            if (original.isNotBlank() && !original.equals(text, ignoreCase = true)) {
+                autoCorrectionForRevert = original to text
+            }
+        }
         val content = activeContent
         return if (content.composing.isValid) {
             phantomSpace.setActive(showComposingRegion = false, candidate = candidate)
@@ -268,6 +282,23 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
                 updateLastCommitPosition()
             }
         }
+    }
+
+    fun rememberAutoCorrection(candidate: SuggestionCandidate) {
+        val corrected = candidate.text.toString()
+        val original = (candidate as? WordSuggestionCandidate)?.originalText?.toString().orEmpty().ifBlank {
+            activeContent.composingText.ifBlank {
+                activeContent.currentWordText.ifBlank { currentTokenBeforeCursor() }
+            }
+        }
+        if (isAutoCorrectionSuppressed(original)) return
+        if (original.isNotBlank() && corrected.isNotBlank() && !original.equals(corrected, ignoreCase = true)) {
+            autoCorrectionForRevert = original to corrected
+        }
+    }
+
+    fun isAutoCorrectionSuppressed(original: String): Boolean {
+        return original.isNotBlank() && suppressedAutoCorrectionToken.equals(original, ignoreCase = true)
     }
 
     /**
@@ -341,6 +372,7 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
      * @return True on success, false if an error occurred or the input connection is invalid.
      */
     fun deleteBackwards(unit: OperationUnit): Boolean {
+        if (unit == OperationUnit.CHARACTERS && revertLastAutoCorrection()) return true
         val content = activeContent
         if (unit == OperationUnit.CHARACTERS) {
             if (phantomSpace.isActive && content.currentWord.isValid && prefs.glide.immediateBackspaceDeletesWord.get()) {
@@ -481,6 +513,68 @@ class EditorInstance(context: Context) : AbstractEditorInstance(context) {
             ic.performContextMenuAction(android.R.id.selectAll)
         }
     }
+
+    fun performSelectCurrentWord(): Boolean {
+        val ic = currentInputConnection() ?: return false
+        val extracted = ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0) ?: return false
+        val text = extracted.text ?: return false
+        if (text.isEmpty()) return false
+        var start = extracted.selectionStart.coerceIn(0, text.length)
+        var end = extracted.selectionEnd.coerceIn(start, text.length)
+        if (start < end) return true
+        if (start == text.length || !text[start].isWordCharacter()) start--
+        while (start >= 0 && !text[start].isWordCharacter()) start--
+        if (start < 0) return false
+        end = start + 1
+        while (start > 0 && text[start - 1].isWordCharacter()) start--
+        while (end < text.length && text[end].isWordCharacter()) end++
+        ic.finishComposingText()
+        return ic.setSelection(start, end)
+    }
+
+    fun performDeleteSelectionOrWord(): Boolean {
+        val ic = currentInputConnection() ?: return false
+        if (ic.getSelectedText(0).isNullOrEmpty() && !performSelectCurrentWord()) return false
+        return commitText("")
+    }
+
+    fun revertAutoCorrection(original: String, corrected: String): Boolean {
+        val ic = currentInputConnection() ?: return false
+        if (!ic.getSelectedText(0).isNullOrEmpty()) return false
+        val beforeCursor = ic.getTextBeforeCursor(corrected.length + 1, 0)?.toString() ?: return false
+        val matchedSuffix = when {
+            beforeCursor.endsWith("$corrected ", ignoreCase = true) ->
+                beforeCursor.takeLast(corrected.length + 1)
+            beforeCursor.endsWith(corrected, ignoreCase = true) ->
+                beforeCursor.takeLast(corrected.length)
+            else -> return false
+        }
+        autoSpace.setInactive()
+        phantomSpace.setInactive()
+        ic.beginBatchEdit()
+        ic.finishComposingText()
+        val didDelete = ic.deleteSurroundingText(matchedSuffix.length, 0)
+        val didCommit = didDelete && ic.commitText(original, 1)
+        ic.endBatchEdit()
+        return didCommit
+    }
+
+    fun revertLastAutoCorrection(): Boolean {
+        val correction = autoCorrectionForRevert ?: return false
+        return revertAutoCorrection(correction.first, correction.second).also { didRevert ->
+            if (didRevert) {
+                suppressedAutoCorrectionToken = correction.first
+                autoCorrectionForRevert = null
+            }
+        }
+    }
+
+    fun currentTokenBeforeCursor(): String {
+        val text = currentInputConnection()?.getTextBeforeCursor(128, 0)?.toString() ?: return ""
+        return text.takeLastWhile { it.isWordCharacter() }
+    }
+
+    private fun Char.isWordCharacter(): Boolean = isLetterOrDigit() || this == '\''
 
     /**
      * Performs an enter key press on the current input editor.

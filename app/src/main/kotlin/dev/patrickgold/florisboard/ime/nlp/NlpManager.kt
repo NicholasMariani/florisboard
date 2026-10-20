@@ -251,7 +251,12 @@ class NlpManager(context: Context) {
     }
 
     fun getAutoCommitCandidate(): SuggestionCandidate? {
-        return activeCandidates.firstOrNull { it.isEligibleForAutoCommit }
+        return activeCandidates.firstOrNull { candidate ->
+            if (!candidate.isEligibleForAutoCommit) return@firstOrNull false
+            val original = (candidate as? WordSuggestionCandidate)?.originalText?.toString()
+                ?: editorInstance.activeContent.composingText
+            !editorInstance.isAutoCorrectionSuppressed(original)
+        }
     }
 
     fun removeSuggestion(subtype: Subtype, candidate: SuggestionCandidate): Boolean {

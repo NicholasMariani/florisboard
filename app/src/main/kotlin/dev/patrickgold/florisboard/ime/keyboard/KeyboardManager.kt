@@ -427,6 +427,7 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
             it.isManualSelectionModeStart = false
             it.isManualSelectionModeEnd = false
         }
+        if (unit == OperationUnit.CHARACTERS && editorInstance.revertLastAutoCorrection()) return
         revertPreviouslyAcceptedCandidate()
         editorInstance.deleteBackwards(unit)
     }
@@ -540,6 +541,7 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
      */
     fun handleHardwareKeyboardSpace() {
         val candidate = nlpManager.getAutoCommitCandidate()
+        candidate?.let { editorInstance.rememberAutoCorrection(it) }
         candidate?.let { commitCandidate(it) }
         // Skip handling changing to characters keyboard and double space periods
         // TODO: this is whether we commit space after selecting candidate. Should be determined by SuggestionProvider
@@ -555,6 +557,7 @@ class KeyboardManager(context: Context) : InputKeyEventReceiver {
      */
     private fun handleSpace(data: KeyData) {
         val candidate = nlpManager.getAutoCommitCandidate()
+        candidate?.let { editorInstance.rememberAutoCorrection(it) }
         candidate?.let { commitCandidate(it) }
         if (prefs.keyboard.spaceBarSwitchesToCharacters.get()) {
             when (activeState.keyboardMode) {

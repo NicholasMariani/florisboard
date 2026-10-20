@@ -44,9 +44,11 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.ContentDrawScope
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
@@ -186,7 +188,7 @@ fun TextKeyboardLayout(
             }
             .drawWithContent {
                 drawContent()
-                if (glideEnabled && glideShowTrail) {
+                if (glideShowTrail) {
                     val targetDist = 3.0f
                     val radius = 20.0f
 
@@ -198,13 +200,34 @@ fun TextKeyboardLayout(
                             targetDist,
                             controller.fadingGlideRadius,
                             radiusReductionFactor,
-                            glideTrailColor,
+                            if (controller.isCustomGestureTrail) Color.Red else glideTrailColor,
                         )
                     }
                     if (controller.isGliding && controller.glideDataForDrawing.isNotEmpty()) {
                         controller.drawGlideTrail(
                             this, controller.glideDataForDrawing, targetDist, radius,
-                            radiusReductionFactor, glideTrailColor,
+                            radiusReductionFactor,
+                            if (controller.isCustomGestureTrail) Color.Red else glideTrailColor,
+                        )
+                    }
+                }
+                if (controller.isSpaceSelectionMode) {
+                    keyboard.keys().asSequence().firstOrNull {
+                        it.computedData.code == KeyCode.SPACE || it.computedData.code == KeyCode.CJK_SPACE
+                    }?.visibleBounds?.let { bounds ->
+                        val color = Color(0xFF1E88E5)
+                        drawRoundRect(
+                            color = color.copy(alpha = 0.24f),
+                            topLeft = Offset(bounds.left, bounds.top),
+                            size = Size(bounds.width, bounds.height),
+                            cornerRadius = CornerRadius(14.dp.toPx()),
+                        )
+                        drawRoundRect(
+                            color = color,
+                            topLeft = Offset(bounds.left, bounds.top),
+                            size = Size(bounds.width, bounds.height),
+                            cornerRadius = CornerRadius(14.dp.toPx()),
+                            style = Stroke(width = 3.dp.toPx()),
                         )
                     }
                 }
@@ -400,6 +423,8 @@ private class TextKeyboardLayoutController(
     private var initSelectionStart: Int = 0
     private var initSelectionEnd: Int = 0
     var isGliding by mutableStateOf(false)
+    var isCustomGestureTrail by mutableStateOf(false)
+    var isSpaceSelectionMode by mutableStateOf(false)
 
     val glideTypingDetector = GlideTypingGesture.Detector(context)
     val glideDataForDrawing = mutableStateListOf<Pair<GlideTypingGesture.Detector.Position, Long>>()
@@ -472,6 +497,11 @@ private class TextKeyboardLayoutController(
                     val pointer = pointerMap.findById(pointerId)
                     if (pointer != null) {
                         pointer.index = pointerIndex
+                        pointer.gestureTargetKey = keyboard.getKeyForPos(
+                            event.getX(pointerIndex),
+                            event.getY(pointerIndex),
+                        )
+                        updateSpaceGestureTrail(event, pointer)
                         val alwaysTriggerOnMove = (pointer.hasTriggeredGestureMove
                             && (pointer.initialKey?.computedData?.code == KeyCode.DELETE
                             && prefs.gestures.deleteKeySwipeLeft.get().let {
@@ -496,7 +526,17 @@ private class TextKeyboardLayoutController(
                 val pointer = pointerMap.findById(pointerId)
                 if (pointer != null) {
                     pointer.index = pointerIndex
-                    if (swipeGestureDetector.onTouchUp(event, pointer) || pointer.hasTriggeredGestureMove) {
+                    pointer.gestureTargetKey = keyboard.getKeyForPos(
+                        event.getX(pointerIndex),
+                        event.getY(pointerIndex),
+                    )
+                    val handledSpaceLetterGesture = executeSpaceToLetterGesture(pointer)
+                    finishSpaceGesture(pointer)
+                    exitSpaceSelectionMode(pointer)
+                    val revertedAutoCorrection = !pointer.hasTriggeredGestureMove &&
+                        pointer.initialKey?.computedData?.code == KeyCode.DELETE &&
+                        editorInstance.revertLastAutoCorrection()
+                    if (handledSpaceLetterGesture || revertedAutoCorrection || swipeGestureDetector.onTouchUp(event, pointer) || pointer.hasTriggeredGestureMove) {
                         if (pointer.hasTriggeredGestureMove && pointer.initialKey?.computedData?.code == KeyCode.DELETE) {
                             val selection = editorInstance.activeContent.selection
                             if (selection.isSelectionMode) {
@@ -516,7 +556,17 @@ private class TextKeyboardLayoutController(
                 for (pointer in pointerMap) {
                     if (pointer.id == pointerId) {
                         pointer.index = pointerIndex
-                        if (swipeGestureDetector.onTouchUp(event, pointer) || pointer.hasTriggeredGestureMove) {
+                        pointer.gestureTargetKey = keyboard.getKeyForPos(
+                            event.getX(pointerIndex),
+                            event.getY(pointerIndex),
+                        )
+                        val handledSpaceLetterGesture = executeSpaceToLetterGesture(pointer)
+                        finishSpaceGesture(pointer)
+                        exitSpaceSelectionMode(pointer)
+                        val revertedAutoCorrection = !pointer.hasTriggeredGestureMove &&
+                            pointer.initialKey?.computedData?.code == KeyCode.DELETE &&
+                            editorInstance.revertLastAutoCorrection()
+                        if (handledSpaceLetterGesture || revertedAutoCorrection || swipeGestureDetector.onTouchUp(event, pointer) || pointer.hasTriggeredGestureMove) {
                             if (pointer.hasTriggeredGestureMove &&
                                 pointer.initialKey?.computedData?.code == KeyCode.DELETE &&
                                 prefs.gestures.deleteKeySwipeLeft.get() != SwipeAction.SELECT_CHARACTERS_PRECISELY &&
@@ -539,6 +589,8 @@ private class TextKeyboardLayoutController(
             }
             MotionEvent.ACTION_CANCEL -> {
                 for (pointer in pointerMap) {
+                    finishSpaceGesture(pointer)
+                    exitSpaceSelectionMode(pointer)
                     swipeGestureDetector.onTouchCancel(event, pointer)
                     onTouchCancelInternal(event, pointer)
                 }
@@ -559,14 +611,10 @@ private class TextKeyboardLayoutController(
                     pointer.hasTriggeredLongPress = true
                     when (key.computedData.code) {
                         KeyCode.SPACE, KeyCode.CJK_SPACE -> {
-                            when (prefs.gestures.spaceBarLongPress.get()) {
-                                SwipeAction.NO_ACTION,
-                                SwipeAction.INSERT_SPACE -> {
-                                }
-                                else -> {
-                                    keyboardManager.executeSwipeAction(prefs.gestures.spaceBarLongPress.get())
-                                }
-                            }
+                            pointer.isSpaceSelectionMode = true
+                            isSpaceSelectionMode = true
+                            keyboardManager.activeState.isManualSelectionMode = true
+                            inputFeedbackController?.keyLongPress(key.computedData)
                             true
                         }
                         KeyCode.SHIFT -> {
@@ -603,6 +651,8 @@ private class TextKeyboardLayoutController(
             key.isPressed = true
             if (pointer.initialKey == null) {
                 pointer.initialKey = key
+                pointer.initialTouchX = event.getX(pointer.index)
+                pointer.initialTouchY = event.getY(pointer.index)
             }
             pointer.activeKey = key
             initSelectionStart = editorInstance.activeContent.selection.start
@@ -635,6 +685,46 @@ private class TextKeyboardLayoutController(
                     onTouchDownInternal(event, pointer)
                 }
             }
+        }
+    }
+
+    private fun updateSpaceGestureTrail(event: MotionEvent, pointer: TouchPointer) {
+        val initialCode = pointer.initialKey?.computedData?.code ?: return
+        if (initialCode != KeyCode.SPACE && initialCode != KeyCode.CJK_SPACE) return
+        val targetCode = pointer.gestureTargetKey?.computedData?.code ?: return
+        if (targetCode <= KeyCode.SPACE || targetCode.toChar().lowercaseChar() !in SPACE_LETTER_GESTURES) return
+        if (!pointer.isSpaceGestureTrailActive) {
+            glideDataForDrawing.clear()
+            glideDataForDrawing.add(
+                GlideTypingGesture.Detector.Position(pointer.initialTouchX, pointer.initialTouchY) to
+                    System.currentTimeMillis(),
+            )
+            pointer.isSpaceGestureTrailActive = true
+            isCustomGestureTrail = true
+            isGliding = true
+        }
+        glideDataForDrawing.add(
+            GlideTypingGesture.Detector.Position(
+                event.getX(pointer.index),
+                event.getY(pointer.index),
+            ) to System.currentTimeMillis(),
+        )
+    }
+
+    private fun finishSpaceGesture(pointer: TouchPointer) {
+        if (pointer.isSpaceGestureTrailActive) {
+            pointer.isSpaceGestureTrailActive = false
+            onGlideCancelled()
+        }
+    }
+
+    private fun exitSpaceSelectionMode(pointer: TouchPointer) {
+        if (pointer.isSpaceSelectionMode) {
+            pointer.isSpaceSelectionMode = false
+            isSpaceSelectionMode = false
+            keyboardManager.activeState.isManualSelectionMode = false
+            keyboardManager.activeState.isManualSelectionModeStart = false
+            keyboardManager.activeState.isManualSelectionModeEnd = false
         }
     }
 
@@ -717,7 +807,9 @@ private class TextKeyboardLayoutController(
 
         return when (initialKey.computedData.code) {
             KeyCode.DELETE -> handleDeleteSwipe(event)
-            KeyCode.SPACE, KeyCode.CJK_SPACE -> handleSpaceSwipe(event)
+            KeyCode.SPACE, KeyCode.CJK_SPACE -> {
+                handleSpaceToLetterGesture(event, pointer) || handleSpaceSwipe(event)
+            }
             else -> when {
                 (initialKey.computedData.code == KeyCode.SHIFT && activeKey?.computedData?.code == KeyCode.SPACE ||
                     initialKey.computedData.code == KeyCode.SHIFT && activeKey?.computedData?.code == KeyCode.CJK_SPACE) &&
@@ -914,10 +1006,50 @@ private class TextKeyboardLayoutController(
         }
     }
 
+    private fun handleSpaceToLetterGesture(event: SwipeGesture.Event, pointer: TouchPointer): Boolean {
+        val target = pointer.gestureTargetKey ?: return false
+        val code = target.computedData.code
+        if (code <= KeyCode.SPACE) return false
+        val letter = code.toChar().lowercaseChar()
+
+        // Actual execution happens directly in ACTION_UP so held/slow gestures work too.
+        return event.type == SwipeGesture.Type.TOUCH_MOVE && letter in SPACE_LETTER_GESTURES
+    }
+
+    private fun executeSpaceToLetterGesture(pointer: TouchPointer): Boolean {
+        val initialCode = pointer.initialKey?.computedData?.code ?: return false
+        if (initialCode != KeyCode.SPACE && initialCode != KeyCode.CJK_SPACE) return false
+        val code = pointer.gestureTargetKey?.computedData?.code ?: return false
+        if (code <= KeyCode.SPACE) return false
+        val handled = when (code.toChar().lowercaseChar()) {
+            'w' -> editorInstance.performSelectCurrentWord()
+            'a' -> editorInstance.performClipboardSelectAll()
+            'c' -> editorInstance.performClipboardCopy()
+            'x' -> editorInstance.performClipboardCut()
+            'v' -> editorInstance.performClipboardPaste()
+            'd' -> editorInstance.performDeleteSelectionOrWord()
+            'e', 'g' -> {
+                keyboardManager.executeSwipeAction(SwipeAction.SWITCH_TO_MEDIA_CONTEXT)
+                true
+            }
+            else -> false
+        }
+        if (handled) {
+            pointer.hasTriggeredGestureMove = true
+            inputFeedbackController?.gestureMovingSwipe(TextKeyData.SPACE)
+        }
+        return handled
+    }
+
     override fun onGlideAddPoint(point: GlideTypingGesture.Detector.Position) {
         if (isGlideEnabled) {
+            isCustomGestureTrail = false
             glideDataForDrawing.add(point to System.currentTimeMillis())
         }
+    }
+
+    companion object {
+        private val SPACE_LETTER_GESTURES = setOf('w', 'a', 'c', 'x', 'v', 'd', 'e', 'g')
     }
 
     override fun onGlideComplete(data: GlideTypingGesture.Detector.PointerData) {
@@ -981,6 +1113,11 @@ private class TextKeyboardLayoutController(
     private class TouchPointer : Pointer() {
         var initialKey: TextKey? = null
         var activeKey: TextKey? = null
+        var gestureTargetKey: TextKey? = null
+        var initialTouchX: Float = 0.0f
+        var initialTouchY: Float = 0.0f
+        var isSpaceGestureTrailActive: Boolean = false
+        var isSpaceSelectionMode: Boolean = false
         var hasTriggeredGestureMove: Boolean = false
         var hasTriggeredLongPress: Boolean = false
         var hasTriggeredMassSelection: Boolean = false
@@ -990,6 +1127,11 @@ private class TextKeyboardLayoutController(
             super.reset()
             initialKey = null
             activeKey = null
+            gestureTargetKey = null
+            initialTouchX = 0.0f
+            initialTouchY = 0.0f
+            isSpaceGestureTrailActive = false
+            isSpaceSelectionMode = false
             hasTriggeredGestureMove = false
             hasTriggeredLongPress = false
             hasTriggeredMassSelection = false

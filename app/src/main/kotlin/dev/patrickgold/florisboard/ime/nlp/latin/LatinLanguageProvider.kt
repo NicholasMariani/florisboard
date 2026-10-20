@@ -24,6 +24,7 @@ import dev.patrickgold.florisboard.ime.nlp.SpellingProvider
 import dev.patrickgold.florisboard.ime.nlp.SpellingResult
 import dev.patrickgold.florisboard.ime.nlp.SuggestionCandidate
 import dev.patrickgold.florisboard.ime.nlp.SuggestionProvider
+import dev.patrickgold.florisboard.ime.nlp.WordSuggestionCandidate
 import dev.patrickgold.florisboard.lib.devtools.flogDebug
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -87,15 +88,10 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         allowPossiblyOffensive: Boolean,
         isPrivateSession: Boolean,
     ): SpellingResult {
-        return when (word.lowercase()) {
-            // Use typo for typing errors
-            "typo" -> SpellingResult.typo(arrayOf("typo1", "typo2", "typo3"))
-            // Use grammar error if the algorithm can detect this. On Android 11 and lower grammar errors are visually
-            // marked as typos due to a lack of support
-            "gerror" -> SpellingResult.grammarError(arrayOf("grammar1", "grammar2", "grammar3"))
-            // Use valid word for valid input
-            else -> SpellingResult.validWord()
-        }
+        val normalized = word.lowercase()
+        val known = wordData.withLock { normalized in it }
+        if (known) return SpellingResult.validWord()
+        return SpellingResult.typo(rankedWords(normalized, maxSuggestionCount, false).toTypedArray())
     }
 
     override suspend fun suggest(
@@ -105,21 +101,72 @@ class LatinLanguageProvider(context: Context) : SpellingProvider, SuggestionProv
         allowPossiblyOffensive: Boolean,
         isPrivateSession: Boolean,
     ): List<SuggestionCandidate> {
-        return emptyList()
-        /*val word = content.composingText.ifBlank { "next" }
-        val suggestions = buildList {
-            for (n in 0 until maxCandidateCount) {
-                add(WordSuggestionCandidate(
-                    text = "$word$n",
-                    secondaryText = if (n % 2 == 1) "secondary" else null,
-                    confidence = 0.5,
-                    isEligibleForAutoCommit = false,//n == 0 && word.startsWith("auto"),
-                    // We set ourselves as the source provider so we can get notify events for our candidate
-                    sourceProvider = this@LatinLanguageProvider,
-                ))
-            }
+        val source = content.composingText
+        val typed = source.trim().lowercase()
+        if (typed.isEmpty() || maxCandidateCount <= 0) return emptyList()
+        val isKnownWord = wordData.withLock { typed in it }
+        val ranked = rankedWords(typed, maxCandidateCount, true).let { words ->
+            if (isKnownWord) listOf(typed) + words.filterNot { it == typed } else words
+        }.take(maxCandidateCount)
+        return ranked.mapIndexed { index, word ->
+            val isTypoCorrection = !isKnownWord && boundedEditDistance(typed, word, 1) == 1
+            WordSuggestionCandidate(
+                text = matchCase(word, source),
+                originalText = source,
+                confidence = (1.0 - index * 0.08).coerceAtLeast(0.1),
+                isEligibleForAutoCommit = index == 0 && isTypoCorrection,
+                sourceProvider = this@LatinLanguageProvider,
+            )
         }
-        return suggestions*/
+    }
+
+    private suspend fun rankedWords(input: String, limit: Int, includeCompletions: Boolean): List<String> {
+        if (input.isBlank() || limit <= 0) return emptyList()
+        return wordData.withLock { words ->
+            words.asSequence()
+                .mapNotNull { (word, frequency) ->
+                    val prefix = includeCompletions && word.startsWith(input)
+                    val distance = if (prefix) 0 else boundedEditDistance(input, word, 2)
+                    if (!prefix && distance > 2) null else Triple(word, distance, frequency)
+                }
+                .sortedWith(
+                    compareBy<Triple<String, Int, Int>> { it.second }
+                        .thenByDescending { it.third }
+                        .thenBy { it.first.length },
+                )
+                .take(limit)
+                .map { it.first }
+                .toList()
+        }
+    }
+
+    private fun boundedEditDistance(left: String, right: String, limit: Int): Int {
+        if (kotlin.math.abs(left.length - right.length) > limit) return limit + 1
+        var previous = IntArray(right.length + 1) { it }
+        for (i in left.indices) {
+            val current = IntArray(right.length + 1)
+            current[0] = i + 1
+            var rowMin = current[0]
+            for (j in right.indices) {
+                current[j + 1] = minOf(
+                    current[j] + 1,
+                    previous[j + 1] + 1,
+                    previous[j] + if (left[i] == right[j]) 0 else 1,
+                )
+                rowMin = minOf(rowMin, current[j + 1])
+            }
+            if (rowMin > limit) return limit + 1
+            previous = current
+        }
+        return previous[right.length]
+    }
+
+    private fun matchCase(word: String, source: String): String {
+        return if (source.firstOrNull()?.isUpperCase() == true) {
+            word.replaceFirstChar { it.uppercase() }
+        } else {
+            word
+        }
     }
 
     override suspend fun notifySuggestionAccepted(subtype: Subtype, candidate: SuggestionCandidate) {
